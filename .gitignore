@@ -3,3 +3,4 @@ zd_gjzq/
 scripts/shim/*.dll
 scripts/shim/inject.exe
 scripts/shim/.build
+scripts/.refresh
