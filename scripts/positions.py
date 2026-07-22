@@ -1,27 +1,65 @@
 #!/usr/bin/env python3
-# 一键：编译 shim → 注入到 TdxW.exe → 验证控制通道 → 读持仓 → 展示。
-# 一条命令走完：sudo python3 scripts/positions.py
-# 缺交叉编译器会自动 apt 装 gcc-mingw-w64-i686（所以需要 root/sudo）。
+# 一键：编译 shim → 注入到 TdxW.exe → 控制通道 → 消息 spy / 主动 refresh → 读持仓 → 展示。
+# 一条命令走完：python3 scripts/positions.py
+# 缺交叉编译运行时时只对 apt 那步走 sudo（会提示输密码）；其余按当前用户跑。
+# 注意：不要整脚本 sudo——wine 会切到 root 的 WINEPREFIX，看不到你正在跑的 tdxw。
 #
-# 当前（阶段1）：编译 + 注入 + ping/pong 证明 + 被动读内存持仓。
-# TODO（阶段2）：shim 的 refresh 命令触发客户端内部刷新持仓（触发点待 RE 填 target.h），
-#               届时本脚本发 "refresh" 再读新鲜内存，不再依赖 UI 先点一次。
+# 子命令：
+#   python3 scripts/positions.py            # poll：编译+注入+ping+被动读持仓+表格
+#   python3 scripts/positions.py spy        # 抓「刷新持仓」的 WM_COMMAND（去 UI 点一次刷新）
+#   python3 scripts/positions.py refresh    # 主动触发客户端刷新持仓，再读新鲜内存展示
+#   python3 scripts/positions.py --no-inject  # poll 但跳过编译注入（shim 已在）
 #
-# 前提：客户端已登录交易。被动读还需 UI 点过一次持仓查询；阶段2 完成后免去此步。
-# 需要可读 /proc/<pid>/mem：建议 sudo 跑。
+# 阶段2 配置：spy 抓到 (hwnd, wparam, lparam) 后写入
+#   C:\windows\temp\tdx_shim_target.txt（即 ~/.wine/drive_c/windows/temp/tdx_shim_target.txt）
+#   第一行 hwnd（0x...）或 class=类名，第二行 wparam（0x...），第三行 lparam（0x...）。
+#   之后 `positions.py refresh` 即主动刷新。
 #
-# 用法：
-#   sudo python3 scripts/positions.py            # 编译 + 注入 + ping + 读持仓 + 表格
-#   sudo python3 scripts/positions.py --no-inject  # 跳过编译注入，只读持仓（shim 已在）
+# 前提：客户端已登录交易。poll/refresh 读内存还需持仓窗口至少打开过一次。
 
 import sys, os, re, subprocess, json, socket
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SHIM_DIR = os.path.join(HERE, "shim")
-SHIM_DLL = os.path.join(SHIM_DIR, "shim.dll")
 INJECT_EXE = os.path.join(SHIM_DIR, "inject.exe")
-CTRL_PORT = 17703
+BUILD_FILE = os.path.join(SHIM_DIR, ".build")
+WINE_TEMP = os.path.expanduser("~/.wine/drive_c/windows/temp")
+SHIM_PORT_FILE = os.path.join(WINE_TEMP, "tdx_shim_port.txt")
 GCC = "i686-w64-mingw32-gcc"
+
+
+# ---------- 构建信息 ----------
+# shim 改动后用源码哈希做唯一 DLL 名 + 端口，这样再注入是全新加载（DllMain 重跑），
+# 不用重启客户端就能换上新 shim。旧 shim 仍留在进程里监听旧端口，无害。
+import hashlib
+
+
+def _src_hash():
+    h = hashlib.sha1()
+    for n in ("shim.c", "inject.c", "target.h"):
+        with open(os.path.join(SHIM_DIR, n), "rb") as f:
+            h.update(f.read())
+    return h.hexdigest()[:8]
+
+
+def _write_build(dll_name, port):
+    with open(BUILD_FILE, "w") as f:
+        f.write(f"{dll_name}\n{port}\n")
+
+
+def _build_info():
+    """返回 (dll_name, port)。没构建过返回 (None, None)。"""
+    if not os.path.exists(BUILD_FILE):
+        return None, None
+    lines = open(BUILD_FILE).read().splitlines()
+    if len(lines) < 2:
+        return None, None
+    return lines[0].strip() or None, int(lines[1])
+
+
+def _ctrl_port():
+    _, port = _build_info()
+    return port or 17703
 
 
 # ---------- 编译 ----------
@@ -30,32 +68,33 @@ def ensure_compiler():
     r = subprocess.run(["which", GCC], capture_output=True, text=True)
     if r.returncode == 0 and r.stdout.strip():
         return
-    print(f"[*] 未找到 {GCC}，apt 安装 gcc-mingw-w64-i686（需要 root/sudo）")
-    subprocess.run(["apt-get", "install", "-y", "gcc-mingw-w64-i686"], check=True)
-
-
-def _newest(*paths):
-    return max(os.path.getmtime(p) for p in paths)
+    print(f"[*] 未找到 {GCC}，sudo apt 安装 gcc-mingw-w64-i686（会提示输密码）")
+    # 只这一步需要 root；编译/注入/读内存都不需要 sudo，且整脚本用 sudo 跑会切到 root 的
+    # WINEPREFIX，看不到 chuyin prefix 里正在跑的 tdxw，所以不能整脚本 sudo。
+    subprocess.run(["sudo", "apt-get", "install", "-y", "gcc-mingw-w64-i686"], check=True)
+    r2 = subprocess.run(["which", GCC], capture_output=True, text=True)
+    assert r2.returncode == 0 and r2.stdout.strip(), f"{GCC} 安装后仍不可用"
 
 
 def compile_shim():
-    """编译 shim.dll + inject.exe（32 位匹配 TdxW）。已是最新则跳过。"""
-    srcs = [os.path.join(SHIM_DIR, "shim.c"),
-            os.path.join(SHIM_DIR, "inject.c"),
-            os.path.join(SHIM_DIR, "target.h")]
-    if os.path.exists(SHIM_DLL) and os.path.exists(INJECT_EXE) \
-            and os.path.getmtime(SHIM_DLL) >= _newest(*srcs) \
-            and os.path.getmtime(INJECT_EXE) >= _newest(*srcs):
-        print("[*] shim.dll/inject.exe 已是最新，跳过编译")
+    """编译 shim_<hash>.dll + inject.exe（32 位匹配 TdxW）。源码没变则跳过。"""
+    H = _src_hash()
+    dll_name = f"shim_{H}.dll"
+    dll_path = os.path.join(SHIM_DIR, dll_name)
+    port = 20000 + int(H, 16) % 10000
+    if os.path.exists(dll_path):
+        _write_build(dll_name, port)
+        print(f"[*] {dll_name} 已构建，跳过编译（控制端口 {port}）")
         return
     ensure_compiler()
-    print("[*] 编译 shim.dll / inject.exe")
-    subprocess.run([GCC, "-shared", "-o", SHIM_DLL, "shim.c",
+    print(f"[*] 编译 {dll_name} / inject.exe（控制端口 {port}）")
+    subprocess.run([GCC, "-shared", "-o", dll_path, "shim.c",
                     "-lws2_32", "-luser32", "-lkernel32"],
                    cwd=SHIM_DIR, check=True)
     subprocess.run([GCC, "-o", INJECT_EXE, "inject.c", "-lkernel32"],
                    cwd=SHIM_DIR, check=True)
-    assert os.path.exists(SHIM_DLL) and os.path.exists(INJECT_EXE), "编译后产物仍缺失"
+    assert os.path.exists(dll_path) and os.path.exists(INJECT_EXE), "编译后产物仍缺失"
+    _write_build(dll_name, port)
 
 
 # ---------- shim 注入 ----------
@@ -66,8 +105,11 @@ def to_windows_path(p):
 
 
 def inject_shim():
-    assert os.path.exists(INJECT_EXE) and os.path.exists(SHIM_DLL), "shim 产物缺失（编译失败？）"
-    dll_win = to_windows_path(SHIM_DLL)
+    dll_name, port = _build_info()
+    assert dll_name, "shim 未构建（先 compile_shim）"
+    dll_path = os.path.join(SHIM_DIR, dll_name)
+    assert os.path.exists(dll_path) and os.path.exists(INJECT_EXE), "shim 产物缺失（编译失败？）"
+    dll_win = to_windows_path(dll_path)
     print(f"[*] 注入 {dll_win}")
     r = subprocess.run(["wine", INJECT_EXE, dll_win], capture_output=True, text=True)
     sys.stdout.write(r.stdout)
@@ -76,19 +118,55 @@ def inject_shim():
         raise SystemExit(f"注入失败 rc={r.returncode}")
 
 
-def ping_shim(timeout=2):
-    """连控制通道发 ping，返回应答字符串。连不上返回 None。"""
+def send_cmd(cmd, timeout=2):
+    """连控制通道发一行命令，返回应答文本。连不上返回 None。"""
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.settimeout(timeout)
     try:
-        s.connect(("127.0.0.1", CTRL_PORT))
-        s.sendall(b"ping\n")
-        data = s.recv(256).decode(errors="replace").strip()
-        return data
+        s.connect(("127.0.0.1", _ctrl_port()))
+        s.sendall(cmd.encode() + b"\n")
+        chunks = []
+        while True:
+            try:
+                d = s.recv(4096)
+            except socket.timeout:
+                break
+            if not d:
+                break
+            chunks.append(d)
+            if b"end\n" in b"".join(chunks):
+                break
+        return b"".join(chunks).decode(errors="replace")
     except OSError:
         return None
     finally:
         s.close()
+
+
+def ping_shim(timeout=2):
+    r = send_cmd("ping", timeout)
+    return r.strip() if r else None
+
+
+def ensure_shim():
+    """确保当前源码版本对应的 shim 已注入且在线。先编译（写 .build 定端口），再 ping，不通才注入。"""
+    compile_shim()
+    pong = ping_shim()
+    if pong:
+        print(f"[+] shim 在线: {pong}")
+        return
+    _write_port_file()
+    inject_shim()
+    pong = ping_shim()
+    assert pong, f"shim 注入后 ping 无应答（端口 {_ctrl_port()}）"
+    print(f"[+] shim 在线: {pong}")
+
+
+def _write_port_file():
+    """注入前把控制端口写进 wine 侧文件，shim 启动时读它决定监听端口。"""
+    os.makedirs(WINE_TEMP, exist_ok=True)
+    with open(SHIM_PORT_FILE, "w") as f:
+        f.write(str(_ctrl_port()))
 
 
 # ---------- 持仓读取（被动：扫 TdxW 内存里解密后的明文表）----------
@@ -235,28 +313,59 @@ def print_table(positions):
         ]))
 
 
-# ---------- 主流程 ----------
+# ---------- 子命令：spy / refresh / poll ----------
 
-def main():
-    do_inject = "--no-inject" not in sys.argv
+def cmd_spy():
+    """消息 spy：hook 客户端 UI 线程，捕获点「刷新持仓」时的 WM_COMMAND。
+    用法：python3 scripts/positions.py spy
+    然后在客户端点一次刷新持仓，本脚本打印捕获的 hwnd/cmd_id；Ctrl+C 停。"""
+    import time
+    ensure_shim()
+    r = send_cmd("spy clear")
+    r = send_cmd("spy on")
+    print(f"[*] {r.strip()}")
+    print("[*] 现在去客户端点一次「刷新持仓」... (Ctrl+C 停止 spy)")
+    seen = set()
+    try:
+        while True:
+            r = send_cmd("spy dump", timeout=3)
+            if r:
+                for line in r.splitlines():
+                    if not line or line == "end":
+                        continue
+                    if line not in seen:
+                        seen.add(line)
+                        print("  " + line)
+            time.sleep(1)
+    except KeyboardInterrupt:
+        send_cmd("spy off")
+        print("\n[*] spy off")
+        if seen:
+            print("[*] 把你要的那条 WM_COMMAND 的三行填进")
+            print("    C:\\windows\\temp\\tdx_shim_target.txt（即 ~/.wine/drive_c/windows/temp/tdx_shim_target.txt）")
+            print("    第一行 hwnd（0x...）或 class=类名，第二行 wparam（0x...），第三行 lparam（0x...）")
+            print("    之后 `python3 scripts/positions.py refresh` 即可主动触发刷新。")
 
-    if do_inject:
-        compile_shim()
-        inject_shim()
-        pong = ping_shim()
-        assert pong, "shim 注入后 ping 无应答（检查 wine 输出 / 端口 17703）"
-        print(f"[+] shim 在线: {pong}")
-    else:
-        print("[*] 跳过注入（--no-inject）")
 
-    # TODO 阶段2：这里发 "refresh" 触发客户端刷新持仓，再读新鲜内存。
-    #   s = socket.create_connection(("127.0.0.1", CTRL_PORT)); s.sendall(b"refresh\n"); print(s.recv(256).decode())
+def cmd_refresh():
+    """主动触发客户端刷新持仓，然后读新鲜内存展示。"""
+    ensure_shim()
+    r = send_cmd("refresh")
+    print(f"[*] {r.strip()}")
+    if "no target" in r or "no wparam" in r:
+        print("先跑 `python3 scripts/positions.py spy` 并在客户端点一次刷新持仓，再 refresh", file=sys.stderr)
+        sys.exit(1)
+    import time
+    time.sleep(0.8)  # 等客户端完成查询、明文落堆
+    _poll_and_print()
 
+
+def _poll_and_print():
     pid = find_tdxw_pid()
     assert pid, "找不到 tdxw.exe 进程"
     block = find_best_block(pid)
     if not block:
-        print("内存里没持仓表，先在客户端点一次持仓查询（阶段2 完成后可免去）", file=sys.stderr)
+        print("内存里没持仓表，先在客户端点一次持仓查询", file=sys.stderr)
         sys.exit(1)
     positions = parse(block)
     if not positions:
@@ -264,6 +373,26 @@ def main():
         sys.exit(1)
     print(f"\n=== 持仓 {len(positions)} 只 ===")
     print_table(positions)
+
+
+# ---------- 主流程 ----------
+
+def main():
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    sub = args[0] if args else "poll"
+
+    if sub == "spy":
+        cmd_spy()
+        return
+    if sub == "refresh":
+        cmd_refresh()
+        return
+    # 默认 poll：编译 + 注入 + ping + 被动读持仓 + 表格
+    if "--no-inject" not in sys.argv:
+        ensure_shim()
+    else:
+        print("[*] 跳过注入（--no-inject）")
+    _poll_and_print()
 
 
 if __name__ == "__main__":

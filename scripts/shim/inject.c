@@ -50,9 +50,13 @@ int main(int argc, char **argv) {
     HANDLE th = CreateRemoteThread(hp, NULL, 0, (LPTHREAD_START_ROUTINE)load, remote, 0, NULL);
     if (!th) { printf("CreateRemoteThread 失败 err=%lu\n", GetLastError()); return 6; }
     WaitForSingleObject(th, 5000);
+    DWORD rc = 0;
+    GetExitCodeThread(th, &rc);
     CloseHandle(th);
     VirtualFreeEx(hp, remote, 0, MEM_RELEASE);
     CloseHandle(hp);
-    printf("[+] 注入指令已发出，看 shim 是否在 127.0.0.1:17703 应答 ping\n");
+    // LoadLibraryA 的返回值（模块句柄）就是远程线程退出码；0 表示加载失败。
+    if (rc == 0) { printf("[!] LoadLibraryA 返回 0，DLL 未加载（路径/依赖问题）\n"); return 7; }
+    printf("[+] 注入成功，模块句柄=0x%lx，看 shim 是否在控制端口应答 ping\n", rc);
     return 0;
 }
