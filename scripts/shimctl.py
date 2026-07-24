@@ -4,8 +4,8 @@
 #   spy 抓任意窗口消息、post/send 回放任意消息、enum/find 按 class/title 解析窗口。
 # 业务无关：不假设"持仓"或任何具体动作。动作由调用方按 (target, msg, wparam, lparam) 给出。
 #
-# 环境无关：WINEPREFIX 取环境变量或默认 ~/.wine；路径一律 __file__ 相对；编译器自动探测
-# (gcc-mingw 优先，clang+mingw 运行时次之)；注入用 C:\windows\temp 路径，不依赖 Z: 盘映射。
+# 环境无关：WINEPREFIX 取环境变量或默认 ~/.wine；路径一律 __file__ 相对；编译器用
+# gcc-mingw-w64-i686（自动探测，缺则 sudo apt 装）；注入用 C:\windows\temp 路径，不依赖 Z: 盘映射。
 #
 # 库用法：
 #   from shimctl import Shim, ensure
@@ -13,6 +13,7 @@
 #   s = Shim()
 #   s.spy_on(); ...; s.spy_dump() # 抓消息
 #   s.post("0x503ca", 0x111, 0x2721, 0)   # 回放
+#   s.postcmd(0x111, 0x2721, 0)           # 回放命令到本进程主框架（免 target）
 #   s.enum(); s.find("TdxW_Main")
 #
 # CLI：
@@ -21,6 +22,7 @@
 #   python3 scripts/shimctl.py spy [msg=ID|all]      # 持续 dump 直到 Ctrl+C
 #   python3 scripts/shimctl.py post <target> <msg> <wp> <lp>
 #   python3 scripts/shimctl.py send <target> <msg> <wp> <lp>
+#   python3 scripts/shimctl.py postcmd <msg> <wp> <lp>
 #   python3 scripts/shimctl.py enum [target]
 #   python3 scripts/shimctl.py find class=<cls> [title=<ttl>]
 # target = 0x........ 或 class=<类名>
@@ -43,21 +45,12 @@ PORT_FILE = os.path.join(WINE_TEMP, "tdx_shim_port.txt")
 TARGET_PROC = os.environ.get("SHIM_TARGET_PROC", "tdxw.exe")
 
 GCC = "i686-w64-mingw32-gcc"
-MINGW_SYSROOT = "/usr/i686-w64-mingw32"
 
 
 # ---------- 编译 ----------
 
 def _have(cmd):
     return shutil.which(cmd) is not None
-
-
-def _runtime_here():
-    return os.path.isdir(os.path.join(MINGW_SYSROOT, "include"))
-
-
-def clang_usable():
-    return _have("clang") and _runtime_here()
 
 
 def gcc_usable():
@@ -70,17 +63,10 @@ def _apt_install(pkgs):
 
 
 def ensure_compiler():
-    if clang_usable() or gcc_usable():
+    if gcc_usable():
         return
-    if _have("clang"):
-        _apt_install(["mingw-w64-i686-dev", "binutils-mingw-w64-i686"])
-    else:
-        _apt_install(["gcc-mingw-w64-i686"])
-    assert clang_usable() or gcc_usable(), "安装后仍无可用交叉编译器"
-
-
-def _clang_base():
-    return ["clang", "--target=i686-w64-windows-gnu", f"--sysroot={MINGW_SYSROOT}", "-fuse-ld=lld"]
+    _apt_install(["gcc-mingw-w64-i686"])
+    assert gcc_usable(), "安装后仍无可用交叉编译器"
 
 
 def _gcc_base():
@@ -134,29 +120,10 @@ def _try_compile(base):
 
 
 def build():
-    candidates = []
-    if clang_usable():
-        candidates.append(("clang", _clang_base()))
-    if gcc_usable():
-        candidates.append(("gcc", _gcc_base()))
-    if not candidates:
-        ensure_compiler()
-        candidates.append(("gcc", _gcc_base()))
-    last = None
-    for name, base in candidates:
-        print(f"[*] 用 {name}")
-        try:
-            _try_compile(base)
-            return
-        except subprocess.CalledProcessError as e:
-            last = e
-            print(f"[!] {name} 失败：{e}；尝试下一个")
     if not gcc_usable():
-        print("[*] 兜底装 gcc-mingw-w64-i686")
-        _apt_install(["gcc-mingw-w64-i686"])
-        _try_compile(_gcc_base())
-        return
-    raise SystemExit(f"所有编译器都失败: {last}")
+        ensure_compiler()
+    print("[*] 用 gcc")
+    _try_compile(_gcc_base())
 
 
 # ---------- 注入 ----------
@@ -201,7 +168,7 @@ class Shim:
         s.settimeout(timeout)
         try:
             s.connect(("127.0.0.1", self.port))
-            s.sendall(line.encode() + b"\n")
+            s.sendall(line.encode("gbk") + b"\n")
             chunks = []
             while True:
                 try:
@@ -213,7 +180,7 @@ class Shim:
                 chunks.append(d)
                 if b"end\n" in b"".join(chunks):
                     break
-            return b"".join(chunks).decode(errors="replace")
+            return b"".join(chunks).decode("gbk", errors="replace")
         except OSError:
             return None
         finally:
@@ -242,6 +209,30 @@ class Shim:
 
     def send(self, target, msg, wp, lp):
         return self._cmd(f"send {target} {msg} {wp} {lp}")
+
+    def postcmd(self, msg, wp, lp):
+        return self._cmd(f"postcmd {msg} {wp} {lp}")
+
+    def postvia(self, root_cls, anchor_cls, anchor_title, target_cls, msg, wp, lp):
+        return self._cmd(f"postvia {root_cls} {anchor_cls} {anchor_title} {target_cls} {msg} {wp} {lp}")
+
+    def anchorinfo(self, hwnd):
+        return self._cmd(f"anchorinfo {hwnd}")
+
+    def dlgs(self):
+        return self._cmd("dlgs")
+
+    def find_lv(self, root_cls, anchor_cls, anchor_title, target_cls, child_cls):
+        return self._cmd(f"find_lv {root_cls} {anchor_cls} {anchor_title} {target_cls} {child_cls}")
+
+    def lv_find(self, list_hwnd, text):
+        return self._cmd(f"lv_find {list_hwnd} {text}")
+
+    def lv_dblclick(self, list_hwnd, row):
+        return self._cmd(f"lv_dblclick {list_hwnd} {row}")
+
+    def click_dlg_btn(self, dlg_title, btn_text):
+        return self._cmd(f"click_dlg_btn {dlg_title} {btn_text}")
 
     def enum(self, target=""):
         return self._cmd(f"enum {target}")
@@ -316,6 +307,39 @@ def main():
         target, msg, wp, lp = args[1], _parse_int(
             args[2]), _parse_int(args[3]), _parse_int(args[4])
         print(s.send(target, msg, wp, lp).strip())
+    elif sub == "postcmd":
+        s = ensure()
+        msg, wp, lp = _parse_int(args[1]), _parse_int(
+            args[2]), _parse_int(args[3])
+        print(s.postcmd(msg, wp, lp).strip())
+    elif sub == "postvia":
+        s = ensure()
+        root_cls, anchor_cls, anchor_title, target_cls = args[1], args[2], args[3], args[4]
+        msg, wp, lp = _parse_int(args[5]), _parse_int(
+            args[6]), _parse_int(args[7])
+        print(s.postvia(root_cls, anchor_cls, anchor_title, target_cls, msg, wp, lp).strip())
+    elif sub == "anchorinfo":
+        s = ensure()
+        print(s.anchorinfo(args[1]).strip())
+    elif sub == "dlgs":
+        s = ensure()
+        print(s.dlgs(), end="")
+    elif sub == "find_lv":
+        s = ensure()
+        assert len(args) >= 6, "need root_cls anchor_cls anchor_title target_cls child_cls"
+        print(s.find_lv(*args[1:6]).strip())
+    elif sub == "lv_find":
+        s = ensure()
+        assert len(args) >= 3, "need <list_hwnd> <text>"
+        print(s.lv_find(args[1], args[2]).strip())
+    elif sub == "lv_dblclick":
+        s = ensure()
+        assert len(args) >= 3, "need <list_hwnd> <row>"
+        print(s.lv_dblclick(args[1], args[2]).strip())
+    elif sub == "click_dlg_btn":
+        s = ensure()
+        assert len(args) >= 3, "need <dlg_title> <btn_text>"
+        print(s.click_dlg_btn(args[1], args[2]).strip())
     elif sub == "enum":
         s = ensure()
         target = args[1] if len(args) > 1 else ""

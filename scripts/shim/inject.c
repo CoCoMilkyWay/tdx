@@ -7,9 +7,12 @@
 // 路径，如 Z:\home\chuyin\work\tdx\scripts\shim\shim.dll>
 
 #include <stdio.h>
+
 #include <string.h>
-#include <tlhelp32.h>
+
 #include <windows.h>
+
+#include <tlhelp32.h>
 
 static DWORD find_proc(const char *name) {
   HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
